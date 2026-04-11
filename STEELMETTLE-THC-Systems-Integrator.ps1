@@ -1425,9 +1425,9 @@ function Sync-IntegratorPayload {
 
 function Find-Executable($name) {
     $candidates = @(
-        Join-Path $baseDir $name,
-        Join-Path $toolsDir $name,
-        (Join-Path $baseDir 'bin' $name)
+        (Join-Path $baseDir $name),
+        (Join-Path $toolsDir $name),
+        (Join-Path (Join-Path $baseDir 'bin') $name)
     )
     foreach ($path in $candidates) {
         if (Test-Path $path) { return (Resolve-Path $path).Path }
