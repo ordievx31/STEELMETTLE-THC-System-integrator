@@ -1,0 +1,25 @@
+# Local runtime artifacts
+logs/
+secrets/
+
+# Local tool drop-ins
+tools/*.exe
+tools/*.dll
+
+# Build outputs
+publish/
+build_temp/
+
+# Never publish developer license
+licenses/dev.license.json
+
+# Never publish third-party tool binaries
+tools/*.exe
+tools/*.dll
+tools/*.xml
+Arduino/*.dll
+Arduino/*.xml
+
+# Arduino and STM32 source/firmware ??? embedded in installer EXE, never shipped loose
+Arduino/
+STM32/
