@@ -32,37 +32,26 @@ $toolsDir = Join-Path $baseDir 'tools'
 $logDir = Join-Path $baseDir 'logs'
 $docsDir = Split-Path -Parent $baseDir
 
-# Mach macro installer helper path (loaded lazily on-demand)
+# Mach macro installer helper path (loaded eagerly at script scope)
 $machMacroModulePath = Join-Path $baseDir 'MachMacroInstaller.ps1'
 $script:machMacroModuleLoaded = $false
-
-function Ensure-MachMacroModuleLoaded {
-    if ($script:machMacroModuleLoaded) { return $true }
-    if (-not (Test-Path $machMacroModulePath)) {
-        Write-Host "WARNING: Mach macro helper file not found: $machMacroModulePath" -ForegroundColor Yellow
-        return $false
-    }
-
+if (Test-Path $machMacroModulePath) {
     try {
         . $machMacroModulePath
         $script:machMacroModuleLoaded = $true
-        return $true
-    } catch [System.Management.Automation.PSSecurityException] {
-        # Some systems block .ps1 file execution by policy; load from memory as a safe fallback.
+    } catch {
         try {
             $machMacroRaw = Get-Content -Path $machMacroModulePath -Raw -ErrorAction Stop
             . ([scriptblock]::Create($machMacroRaw))
             $script:machMacroModuleLoaded = $true
-            Write-Host "WARNING: Loaded MachMacroInstaller in-memory due to execution policy restrictions." -ForegroundColor Yellow
-            return $true
         } catch {
-            Write-Host "WARNING: Mach macro helper unavailable: $_" -ForegroundColor Yellow
-            return $false
+            Write-Host "WARNING: Failed to load Mach macro helper: $_" -ForegroundColor Yellow
         }
-    } catch {
-        Write-Host "WARNING: Failed to load Mach macro helper: $_" -ForegroundColor Yellow
-        return $false
     }
+}
+
+function Ensure-MachMacroModuleLoaded {
+    return $script:machMacroModuleLoaded
 }
 
 function ConvertTo-CompatiblePsObject($value) {
@@ -245,6 +234,10 @@ function Test-PendingDevLocksRequireAction {
         return $false
     }
 
+    $tier = Get-LicenseTier
+    # User tier never has pending locks (no dev flash capability)
+    if ($tier -eq 'user') { return $false }
+
     return ((Get-PendingLockTargets).Count -gt 0)
 }
 
@@ -269,15 +262,35 @@ function Ensure-PendingDevLocksBeforeExit {
         return $true
     }
 
-    $result = [System.Windows.Forms.MessageBox]::Show(
-        "Developer mode flashed unlocked firmware for: $($targets -join ', ').`n`nThe device must be production-locked before exiting. Click OK to apply the required lock(s), or Cancel to stay in the app.",
-        'Pending Production Lock',
-        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
-        [System.Windows.Forms.MessageBoxIcon]::Warning
-    )
+    # Owner tier: remind but allow skip. Developer tier: must lock.
+    $tier = Get-LicenseTier
 
-    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
-        return $false
+    if ($tier -eq 'owner') {
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            "Unlocked firmware was flashed for: $($targets -join ', ').`n`nIs this a production unit that needs to be locked?`n`n  Yes = Apply production lock now`n  No = Skip lock and close`n  Cancel = Stay in the app",
+            'Production Lock Reminder',
+            [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
+            return $false
+        }
+        if ($result -eq [System.Windows.Forms.DialogResult]::No) {
+            Log "Owner skipped production lock for: $($targets -join ', ')"
+            return $true
+        }
+        # Yes - fall through to lock logic below
+    } else {
+        # Developer tier: must lock before exit
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            "Developer mode flashed unlocked firmware for: $($targets -join ', ').`n`nThe device must be production-locked before exiting. Click OK to apply the required lock(s), or Cancel to stay in the app.",
+            'Pending Production Lock',
+            [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+            return $false
+        }
     }
 
     foreach ($target in @($targets)) {
@@ -551,6 +564,18 @@ function Get-DevDecodeHash {
     if (-not $obj.licenseType -or ([string]$obj.licenseType).ToLower() -ne 'developer') { return '' }
     if (-not $obj.decodeKeyHash) { return '' }
     return [string]$obj.decodeKeyHash
+}
+
+# Returns 'owner', 'developer', or 'user' based on license files present.
+# owner   = dev license with both devKeyHash AND decodeKeyHash
+# developer = dev license with devKeyHash only (no decodeKeyHash)
+# user    = no dev license (user license only)
+function Get-LicenseTier {
+    $devHash = Get-DevLicenseHash
+    if ([string]::IsNullOrWhiteSpace($devHash)) { return 'user' }
+    $decodeHash = Get-DevDecodeHash
+    if (-not [string]::IsNullOrWhiteSpace($decodeHash)) { return 'owner' }
+    return 'developer'
 }
 
 function Install-DevLicenseFromFile([string]$sourcePath) {
@@ -1093,6 +1118,7 @@ function Get-FirmwareUpdateConfig {
     $f = if ($config -and $config.firmwareUpdate) { $config.firmwareUpdate } else { $null }
     return @{
         checkOnConnect      = if ($f -and $null -ne $f.checkOnConnect) { [bool]$f.checkOnConnect } else { $false }
+        checkOnLaunch       = if ($f -and $null -ne $f.checkOnLaunch) { [bool]$f.checkOnLaunch } else { $false }
         forgeEnabled        = if ($f -and $f.forge -and $null -ne $f.forge.enabled) { [bool]$f.forge.enabled } else { $false }
         forgeRepo           = if ($f -and $f.forge -and $f.forge.repo) { [string]$f.forge.repo } else { '' }
         forgeAssetPattern   = if ($f -and $f.forge -and $f.forge.assetPattern) { [string]$f.forge.assetPattern } else { '' }
@@ -1105,9 +1131,12 @@ function Get-FirmwareUpdateConfig {
 }
 
 function Check-For-FirmwareUpdate {
-    param([ValidateSet('Forge','Core')][string]$Target)
+    param(
+        [ValidateSet('Forge','Core')][string]$Target,
+        [switch]$Force
+    )
     $fw = Get-FirmwareUpdateConfig
-    if (-not $fw.checkOnConnect) { return $null }
+    if (-not $Force -and -not $fw.checkOnConnect -and -not $fw.checkOnLaunch) { return $null }
     $enabled = if ($Target -eq 'Forge') { $fw.forgeEnabled }        else { $fw.coreEnabled }
     if (-not $enabled) { return $null }
     $repo    = if ($Target -eq 'Forge') { $fw.forgeRepo }           else { $fw.coreRepo }
@@ -1258,10 +1287,23 @@ function Apply-ProductionLock {
         $timeoutSeconds = [int]$sec.commandTimeoutSeconds
     }
 
-    Invoke-ConfiguredCommand -CommandLine $cmd -LogFileName ("security-lock-" + $Target.ToLower() + ".log") -TimeoutSeconds $timeoutSeconds
+    $lockLogName = "security-lock-" + $Target.ToLower() + ".log"
+    try {
+        Invoke-ConfiguredCommand -CommandLine $cmd -LogFileName $lockLogName -TimeoutSeconds $timeoutSeconds
+    } catch {
+        # avrdude often exits non-zero even on success; verify from log output
+        $lockLogPath = Join-Path $logDir $lockLogName
+        $lockLogText = if (Test-Path $lockLogPath) { Get-Content -Path $lockLogPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        $lockVerified = $lockLogText -match '(?im)1\s+verified' -and $lockLogText -match '(?im)Avrdude done\.'
+        if (-not $lockVerified) {
+            throw
+        }
+        Log "$Target production lock command exited non-zero but avrdude verified the write."
+    }
     Clear-TargetPendingLock -Target $Target
     Log "$Target production lock command executed successfully."
 }
+
 
 function Set-ObjectProperty([object]$obj, [string]$name, $value) {
     if ($obj.PSObject.Properties[$name]) {
@@ -2247,9 +2289,11 @@ public class TaskbarAppId {
         [System.Environment]::Exit(0)
     }
 
-    function Prompt-And-RunFirmwareUpdateFlow([string]$target) {
+    function Prompt-And-RunFirmwareUpdateFlow([string]$target, [switch]$Force) {
         try {
-            $fw = Check-For-FirmwareUpdate -Target $target
+            $fwParams = @{ Target = $target }
+            if ($Force) { $fwParams['Force'] = $true }
+            $fw = Check-For-FirmwareUpdate @fwParams
             if (-not $fw -or -not $fw.isUpdateAvailable) { return }
             $msg = "$target firmware update available: v$($fw.latestVersion)`nCurrent: v$($fw.currentVersion)`n`nDownload and stage updated $target firmware now?"
             $choice = [System.Windows.Forms.MessageBox]::Show(
@@ -2290,14 +2334,7 @@ public class TaskbarAppId {
         try {
             Apply-ProductionLock -Target $target
         } catch {
-            $logPath = Join-Path $logDir ("security-lock-" + $target.ToLower() + ".log")
-            $logText = if (Test-Path $logPath) { Get-Content -Path $logPath -Raw -ErrorAction SilentlyContinue } else { '' }
-            $lockVerified = $logText -match '(?im)1\s+verified' -and $logText -match '(?im)^Avrdude done\.'
-            if ($lockVerified) {
-                Log "$target production lock completed successfully despite a host-side exception being raised."
-            } else {
-                throw
-            }
+            throw
         }
         Set-UiProgress "$target production lock applied." 100
     }
@@ -2460,7 +2497,12 @@ public class TaskbarAppId {
             Set-UiProgress "Installing $selectedVersion feedrate macro..." 50
             $result = Install-MachFeedrateMacro -MachVersion $selectedVersion
             if ($result.Success) {
-                Set-UiProgress "$selectedVersion macro installed successfully at: $($result.MacroPath)" 100
+                $statusMsg = if ($result.AutoConfigured) {
+                    "$selectedVersion macro fully installed and configured at: $($result.MacroPath)"
+                } else {
+                    "$selectedVersion macro installed at: $($result.MacroPath) (manual config needed)"
+                }
+                Set-UiProgress $statusMsg 100
                 [System.Windows.Forms.MessageBox]::Show(
                     "Macro installed to: $($result.MacrosFolder)`n`n$($result.Message)",
                     "$selectedVersion Macro Installation Complete",
@@ -2493,8 +2535,8 @@ public class TaskbarAppId {
         try {
             Set-UiProgress 'Checking for updates...' 30
             Prompt-And-RunUpdateFlow
-            Prompt-And-RunFirmwareUpdateFlow 'Forge'
-            Prompt-And-RunFirmwareUpdateFlow 'Core'
+            Prompt-And-RunFirmwareUpdateFlow 'Forge' -Force
+            Prompt-And-RunFirmwareUpdateFlow 'Core' -Force
         } catch {
             Set-UiProgress 'Unable to check updates right now.' 100
         }
@@ -2574,11 +2616,12 @@ public class TaskbarAppId {
             }
             if (Invoke-DevKeyPrompt) {
                 $script:devModeUnlocked = $true
+                $tier = Get-LicenseTier
                 $btnLockCore.Visible = $true
                 $btnLockForge.Visible = $true
-                $btnDecodePayloads.Visible = $true
+                $btnDecodePayloads.Visible = ($tier -eq 'owner')
                 $btnDevAccess.Visible = $false
-                Set-UiProgress 'Developer mode unlocked. Production lock controls and decode export are now visible.' 100
+                Set-UiProgress 'Developer mode unlocked. Production lock controls are now visible.' 100
             } else {
                 Set-UiProgress 'Developer access denied.' 100
             }
@@ -2589,10 +2632,19 @@ public class TaskbarAppId {
     $panelHome.Controls.Add($btnDevAccess)
 
     # If a valid developer license is present, unlock developer mode automatically.
-    if (-not [string]::IsNullOrWhiteSpace((Get-DevLicenseHash))) {
+    $licenseTier = Get-LicenseTier
+    if ($licenseTier -eq 'owner') {
         $script:devModeUnlocked = $true
         $btnLockCore.Visible = $true
         $btnDecodePayloads.Visible = $true
+        $btnDevAccess.Visible = $false
+    } elseif ($licenseTier -eq 'developer') {
+        $script:devModeUnlocked = $true
+        $btnLockCore.Visible = $true
+        $btnDecodePayloads.Visible = $false
+        $btnDevAccess.Visible = $false
+    } else {
+        # user tier: no dev features, hide dev access button entirely
         $btnDevAccess.Visible = $false
     }
 
@@ -2793,7 +2845,18 @@ public class TaskbarAppId {
 
     Show-HomePanel
 
-    # Keep startup idle: do not auto-run update checks on form show.
+    # One-time firmware update check on launch (non-continuous)
+    $fwCfg = Get-FirmwareUpdateConfig
+    if ($fwCfg.checkOnLaunch) {
+        $form.Add_Shown({
+            try {
+                Prompt-And-RunFirmwareUpdateFlow 'Forge' -Force
+                Prompt-And-RunFirmwareUpdateFlow 'Core' -Force
+            } catch {
+                Log "WARNING: Launch firmware update check failed: $_"
+            }
+        })
+    }
 
     $btnClose = New-Object System.Windows.Forms.Button
     $btnClose.Text = 'Close'
@@ -2810,6 +2873,18 @@ public class TaskbarAppId {
     $btnClose.Cursor = [System.Windows.Forms.Cursors]::Hand
     $btnClose.Add_Click({ $form.Close() })
     $overlay.Controls.Add($btnClose)
+
+    $updateCfg = Get-UpdateConfig
+    $lblVersion = New-Object System.Windows.Forms.Label
+    $lblVersion.Text = "v$($updateCfg.currentVersion)"
+    $lblVersion.AutoSize = $true
+    $lblVersion.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $lblVersion.ForeColor = $textSecondary
+    $lblVersion.BackColor = [System.Drawing.Color]::Transparent
+    $lblVersion.Anchor = [System.Windows.Forms.AnchorStyles]::Right -bor [System.Windows.Forms.AnchorStyles]::Bottom
+    $lblVersion.Location = [System.Drawing.Point]::new(($overlay.ClientSize.Width - 70), ($overlay.ClientSize.Height - 20))
+    $overlay.Controls.Add($lblVersion)
+    $lblVersion.BringToFront()
 
     Update-ResponsiveLayout
 
@@ -3039,11 +3114,12 @@ function Build-And-Flash-Arduino {
 function Deploy-PoKeys {
     Set-UiStage 'Preparing PoKeys deployment...' 60
     Log 'Starting PoKeys deployment flow'
-    $pokeysCli = Find-Executable 'pokeys-cli.exe'
+
+    # Locate the CLI shim (pokeys-cli.ps1)
     $pokeysCliShim = $null
     $shimCandidates = @(
-        Join-Path $baseDir 'pokeys-cli.ps1',
-        Join-Path $toolsDir 'pokeys-cli.ps1'
+        (Join-Path $baseDir 'pokeys-cli.ps1'),
+        (Join-Path $toolsDir 'pokeys-cli.ps1')
     )
     foreach ($candidate in $shimCandidates) {
         if (Test-Path $candidate) {
@@ -3052,51 +3128,26 @@ function Deploy-PoKeys {
         }
     }
 
-    $pokeysDir = Join-Path $baseDir 'PoKeys'
-    $macroFile = if ($config -and $config.pokeys -and $config.pokeys.macroFile) { Join-Path $baseDir $config.pokeys.macroFile } else { Join-Path $pokeysDir 'POKEYS_POEXT_MACROS_CLEAN.txt' }
-
-    if (-not (Test-Path $macroFile)) {
-        Log 'WARNING: PoKeys macro file not found. Place it in the PoKeys folder or update config.json.'
-        return
-    }
-
-    if ($pokeysCli) {
-        Log "Deploying PoKeys macro file via CLI: $macroFile"
-        Set-UiStage 'Found PoKeys, deploying macro...' 85
-        & $pokeysCli --upload-macro $macroFile 2>&1 | Tee-Object -FilePath (Join-Path $logDir 'pokeys-deploy.log')
-        Log 'PoKeys macro deployment complete (CLI).'
-        Set-UiStage 'PoKeys macro deployment complete.' 100
-        return
-    }
-
     if ($pokeysCliShim) {
-        Log "Deploying PoKeys macro file via CLI shim: $pokeysCliShim"
-        Set-UiStage 'Found PoKeys, deploying macro...' 85
-        & $pokeysCliShim --upload-macro $macroFile 2>&1 | Tee-Object -FilePath (Join-Path $logDir 'pokeys-deploy.log')
-        Log 'PoKeys macro deployment complete (CLI shim).'
-        Set-UiStage 'PoKeys macro deployment complete.' 100
+        Log "Deploying PoKeys via DLL: $pokeysCliShim --deploy"
+        Set-UiStage 'Configuring PoKeys device...' 70
+        $deployLog = Join-Path $logDir 'pokeys-deploy.log'
+        $output = & powershell -NoProfile -ExecutionPolicy Bypass -File $pokeysCliShim --deploy 2>&1
+        $output | Out-File -FilePath $deployLog -Encoding utf8
+        $output | ForEach-Object { Log "  $_" }
+        if ($LASTEXITCODE -eq 0) {
+            Log 'PoKeys deployment complete - device configured and bridge started.'
+            Set-UiStage 'PoKeys deployment complete.' 100
+        } else {
+            Log "WARNING: PoKeys deploy exited with code $LASTEXITCODE"
+            Set-UiStage 'PoKeys deployment failed - check log.' 100
+        }
         return
     }
 
-    # Fallback path: use the PoKeys GUI executable when CLI is not available.
-    $pokeysGui = Find-Executable 'PoKeys.exe'
-    if (-not $pokeysGui) {
-        Log 'WARNING: pokeys-cli.exe and PoKeys.exe were not found; skipping PoKeys macro deployment.'
-        return
-    }
-
-    Log "pokeys-cli.exe/shim not found. Launching PoKeys GUI as fallback: $pokeysGui"
-    try {
-        Start-Process -FilePath $pokeysGui -ArgumentList ('"{0}"' -f $macroFile) | Out-Null
-        Log "PoKeys GUI launched with macro file argument: $macroFile"
-    } catch {
-        Start-Process -FilePath $pokeysGui | Out-Null
-        Log 'PoKeys GUI launched without argument; please import macro file manually.'
-    }
-
-    Write-Host 'PoKeys GUI opened for macro deployment.' -ForegroundColor Cyan
-    Write-Host "If macro did not auto-load, import this file in PoKeys: $macroFile" -ForegroundColor Yellow
-    Log 'PoKeys deployment handed off to GUI workflow.'
+    # Fallback: no CLI shim found
+    Log 'WARNING: pokeys-cli.ps1 not found. PoKeys deployment requires the tools folder.'
+    Set-UiStage 'PoKeys CLI not found.' 100
 }
 
 # --- main ---

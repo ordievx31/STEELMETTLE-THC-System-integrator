@@ -31,7 +31,7 @@
   },
   "update": {
     "enabled": true,
-    "currentVersion": "1.0.27",
+    "currentVersion": "1.1.0",
     "repo": "ordievx31/STEELMETTLE-THC-System-integrator",
     "assetNamePattern": "STEELMETTLE-THC-Systems-Integrator-Installer.exe",
     "autoCheckOnLaunch": true,
@@ -49,7 +49,7 @@
   },
   "firmwareUpdate": {
     "checkOnConnect": false,
-    "checkOnLaunch": false,
+    "checkOnLaunch": true,
     "autoSync": true,
     "forge": {
       "enabled": true,
@@ -58,7 +58,7 @@
       "sourceDir": "..\\STM32MX_V3.0.1",
       "watchFiles": ["Core/Src/**/*.c", "Core/Inc/**/*.h"],
       "buildArtifact": "STM32MX_V2.bin",
-      "currentVersion": "3.0.2"
+      "currentVersion": "3.0.3"
     },
     "core": {
       "enabled": true,
@@ -67,7 +67,7 @@
       "sourceDir": "..\\Arduino\\THC_AUTOSET_Firmware",
       "watchFiles": ["*.cpp", "*.h", "*.ino"],
       "buildArtifact": "THC_AUTOSET_Firmware.hex",
-      "currentVersion": "1.0.1"
+      "currentVersion": "1.0.2"
     }
   },
   "fileMonitoring": {
