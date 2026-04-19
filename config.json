@@ -31,7 +31,7 @@
   },
   "update": {
     "enabled": true,
-    "currentVersion": "2.0.0",
+    "currentVersion": "2.0.1",
     "repo": "ordievx31/STEELMETTLE-THC-System-integrator",
     "assetNamePattern": "STEELMETTLE-THC-Systems-Integrator-Installer.exe",
     "autoCheckOnLaunch": true,

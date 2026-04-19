@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # MACH3/MACH4 STEELMETTLE THC Feedrate Macro Installer
 # =============================================================================
 # This module provides functions to detect Mach3/Mach4 installations and
@@ -178,56 +178,85 @@ Restart $MachVersion after installation to activate.
 function Configure-Mach3Startup([string]$MachInstallPath) {
     <#
     .SYNOPSIS
-    Inject SetTimer startup/shutdown lines into Mach3 profile XML files
+    Inject SetTimer startup/shutdown lines into Mach3 profile XML files.
+    Only targets files that contain a <Profile> root element (real Mach3 profiles).
+    Creates a .bak backup before modifying. Idempotent - safe to run multiple times.
     .OUTPUTS
-    @{ Configured = $true/$false; Profiles = @("Mach3Mill.xml",...); Message = "..." }
+    @{ Configured = $true/$false; Profiles = @("MILL.xml",...); Message = "..." }
     #>
     $startupLine   = 'SetTimer 1, 50, SendParametersToTHC'
     $shutdownLine  = 'SetTimer 1, 0'
-    $profileFiles  = Get-ChildItem -Path $MachInstallPath -Filter "Mach3*.xml" -File -ErrorAction SilentlyContinue
+    $startupEsc    = [regex]::Escape($startupLine)
+    $shutdownEsc   = [regex]::Escape($shutdownLine)
     $configured    = @()
     $errors        = @()
 
-    if (-not $profileFiles -or $profileFiles.Count -eq 0) {
-        return @{ Configured = $false; Profiles = @(); Message = "No Mach3 profile XML files found in $MachInstallPath" }
+    # Get all root-level XML files, excluding known non-profile files
+    $xmlFiles = Get-ChildItem -Path $MachInstallPath -Filter '*.xml' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.DirectoryName -eq $MachInstallPath -and $_.Name -ne 'uninstall.xml' }
+
+    if (-not $xmlFiles -or $xmlFiles.Count -eq 0) {
+        return @{ Configured = $false; Profiles = @(); Message = "No XML files found in $MachInstallPath" }
     }
 
-    foreach ($pf in $profileFiles) {
+    foreach ($pf in $xmlFiles) {
         try {
             $content = [System.IO.File]::ReadAllText($pf.FullName, [System.Text.Encoding]::UTF8)
 
-            # Try common Mach3 XML tag names for startup code
-            $startTag  = $null
-            $shutTag   = $null
-            foreach ($tag in @('StartupCode','StartScript','OnStartScript','MacroStartup')) {
-                if ($content -match "<$tag\b") { $startTag = $tag; break }
+            # BUG 1 FIX: Only process files that are actual Mach3 profile XMLs
+            if ($content -notmatch '<Profile\b') {
+                continue
             }
-            foreach ($tag in @('ShutdownCode','ShutdownScript','OnShutdownScript','MacroShutdown')) {
-                if ($content -match "<$tag\b") { $shutTag = $tag; break }
+
+            # Idempotency: skip if both lines are already present
+            $hasStartup  = $content -match $startupEsc
+            $hasShutdown = $content -match $shutdownEsc
+            if ($hasStartup -and $hasShutdown) {
+                $configured += $pf.Name
+                continue
+            }
+
+            # Create backup before modifying
+            $bakPath = $pf.FullName + '.bak'
+            if (-not (Test-Path $bakPath)) {
+                [System.IO.File]::Copy($pf.FullName, $bakPath)
             }
 
             $changed = $false
 
-            # --- Startup injection ---
-            if ($startTag) {
-                # Tag exists - append our line if not already present
-                if ($content -notmatch [regex]::Escape($startupLine)) {
-                    $content = $content -replace "(<$startTag>)(.*?)(</$startTag>)", "`$1`$2`r`n$startupLine`$3"
-                    $changed = $true
+            # --- Startup injection (single pass) ---
+            if (-not $hasStartup) {
+                # Detect existing startup tag (multiline-safe with (?s))
+                $startTag = $null
+                foreach ($tag in @('StartupCode','StartScript','OnStartScript','MacroStartup')) {
+                    if ($content -match "<$tag\b") { $startTag = $tag; break }
                 }
-            } else {
-                # No startup tag found - create one before closing </profile> or </Profile>
-                if ($content -match '</[Pp]rofile>') {
-                    $newBlock = "  <StartupCode>$startupLine</StartupCode>`r`n  <ShutdownCode>$shutdownLine</ShutdownCode>`r`n"
-                    $content = $content -replace '(</[Pp]rofile>)', "$newBlock`$1"
+
+                if ($startTag) {
+                    # Tag exists - append our line inside it ((?s) so .*? spans newlines)
+                    $content = $content -replace "(?s)(<$startTag>)(.*?)(</$startTag>)", "`$1`$2`r`n$startupLine`r`n`$3"
+                    $changed = $true
+                } elseif ($content -match '</[Pp]rofile>') {
+                    # No startup tag - create one before closing </Profile>
+                    $content = $content -replace '(</[Pp]rofile>)', "  <StartupCode>$startupLine</StartupCode>`r`n`$1"
                     $changed = $true
                 }
             }
 
-            # --- Shutdown injection ---
-            if ($shutTag -and ($content -notmatch [regex]::Escape($shutdownLine))) {
-                $content = $content -replace "(<$shutTag>)(.*?)(</$shutTag>)", "`$1`$2`r`n$shutdownLine`$3"
-                $changed = $true
+            # --- Shutdown injection (single pass, independent of startup) ---
+            if (-not $hasShutdown) {
+                $shutTag = $null
+                foreach ($tag in @('ShutdownCode','ShutdownScript','OnShutdownScript','MacroShutdown')) {
+                    if ($content -match "<$tag\b") { $shutTag = $tag; break }
+                }
+
+                if ($shutTag) {
+                    $content = $content -replace "(?s)(<$shutTag>)(.*?)(</$shutTag>)", "`$1`$2`r`n$shutdownLine`r`n`$3"
+                    $changed = $true
+                } elseif ($content -match '</[Pp]rofile>') {
+                    $content = $content -replace '(</[Pp]rofile>)', "  <ShutdownCode>$shutdownLine</ShutdownCode>`r`n`$1"
+                    $changed = $true
+                }
             }
 
             if ($changed) {
@@ -239,6 +268,9 @@ function Configure-Mach3Startup([string]$MachInstallPath) {
         }
     }
 
+    if ($configured.Count -eq 0 -and $errors.Count -eq 0) {
+        return @{ Configured = $false; Profiles = @(); Message = "No Mach3 profile XML files (containing <Profile>) found in $MachInstallPath" }
+    }
     if ($errors.Count -gt 0) {
         return @{ Configured = ($configured.Count -gt 0); Profiles = $configured; Message = "Errors: $($errors -join '; ')" }
     }
@@ -511,3 +543,4 @@ if ($null -ne $ExecutionContext.SessionState.Module) {
         'Install-MachFeedrateMacro'
     )
 }
+
